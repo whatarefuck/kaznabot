@@ -1,0 +1,29 @@
+[Unit]
+Description=kaznabot: Telegram-бот общих трат
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=/opt/kaznabot
+ExecStart=/opt/kaznabot/.venv/bin/python -m kaznabot
+# Токены и настройки; файл читает systemd от root, сам бот к нему доступа не имеет
+EnvironmentFile=/etc/kaznabot.env
+Environment=PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
+# Домашняя папка root сервису закрыта, а библиотеки (LangSmith) ищут в ней свои настройки
+Environment=HOME=/var/lib/kaznabot
+# Кэш шрифтов matplotlib для /chart: строится один раз (на сервере около минуты), deploy.sh прогревает его заранее
+Environment=MPLCONFIGDIR=/var/lib/kaznabot/matplotlib
+
+# Бот разбирает PDF и фото от пользователей, поэтому работает не от root, а от временного
+# пользователя systemd. Писать он может только в /var/lib/kaznabot (базы SQLite).
+DynamicUser=yes
+StateDirectory=kaznabot
+StateDirectoryMode=0700
+# На сервере меньше 1 ГБ памяти и есть соседи
+MemoryMax=400M
+
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
