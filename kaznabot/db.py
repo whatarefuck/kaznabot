@@ -135,6 +135,70 @@ class Draft(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 
+# --- быт квартиры: дежурства и ужины ---
+
+
+class ChatFeatures(Base):
+    """Что бот делает в чате сам, по расписанию."""
+
+    __tablename__ = "chat_features"
+
+    chat_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    duty_reminders: Mapped[bool] = mapped_column(default=False)  # в субботу — кто дежурит в воскресенье
+    dinner_polls: Mapped[bool] = mapped_column(default=False)  # в субботу — голосование, кто когда готовит
+
+
+class DutyRoster(Base):
+    """Ротация уборки: в воскресенье anchor зона zones[i] у people[i], дальше по кругу (см. household.Rotation)."""
+
+    __tablename__ = "duty_rosters"
+
+    chat_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    anchor: Mapped[date] = mapped_column(Date)
+    zones: Mapped[list[str]] = mapped_column(JSON)
+    people: Mapped[list[int]] = mapped_column(JSON)  # users.id
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
+
+
+class JobRun(Base):
+    """Что планировщик уже сделал — чтобы после перезапуска не прислать напоминание дважды."""
+
+    __tablename__ = "job_runs"
+
+    chat_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    job: Mapped[str] = mapped_column(String(32), primary_key=True)
+    key: Mapped[str] = mapped_column(String(32), primary_key=True)  # например, дата воскресенья
+    ran_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class DinnerPoll(Base):
+    """Голосование «кто в какой день готовит ужин» на неделю week_start…week_start+6."""
+
+    __tablename__ = "dinner_polls"
+    __table_args__ = (UniqueConstraint("chat_id", "week_start"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    chat_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    week_start: Mapped[date] = mapped_column(Date)  # понедельник
+    poll_id: Mapped[str] = mapped_column(String(64), unique=True)  # id опроса в Telegram
+    message_id: Mapped[int] = mapped_column(BigInteger)
+    days: Mapped[list[str]] = mapped_column(JSON)  # вариант i → день (ISO); последний вариант — «не смогу»
+    deadline: Mapped[datetime] = mapped_column(DateTime)  # naive UTC
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime)
+    schedule_msg_id: Mapped[int | None] = mapped_column(BigInteger)  # последнее сообщение с графиком
+    schedule: Mapped[dict[str, int | None] | None] = mapped_column(JSON)  # день (ISO) → users.id
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class DinnerVote(Base):
+    __tablename__ = "dinner_votes"
+
+    poll_id: Mapped[int] = mapped_column(ForeignKey("dinner_polls.id"), primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), primary_key=True)
+    options: Mapped[list[int]] = mapped_column(JSON)
+    voted_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
+
+
 def make_engine(url: str) -> AsyncEngine:
     if url.startswith("sqlite") and ":///" in url:
         Path(url.split(":///", 1)[1]).parent.mkdir(parents=True, exist_ok=True)

@@ -5,6 +5,8 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from kaznabot.db import create_tables, make_engine, make_sessionmaker
 
+pytest_plugins = ["tests.tg"]  # фикстура harness — фейковый Telegram с настоящим диспетчером
+
 
 @pytest.fixture
 async def engine() -> AsyncIterator[AsyncEngine]:

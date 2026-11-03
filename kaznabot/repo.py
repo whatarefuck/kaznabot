@@ -3,15 +3,30 @@
 import logging
 from collections.abc import Iterable
 from dataclasses import dataclass, field
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, time
 from zoneinfo import ZoneInfo
 
 from aiogram.types import User as TgUser
-from sqlalchemy import func, select, update
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from kaznabot.ai.schemas import RosterEntry
-from kaznabot.db import Draft, Exclusion, Expense, ExpenseItem, ItemParticipant, Member, Settlement, User, utcnow
+from kaznabot.db import (
+    ChatFeatures,
+    DinnerPoll,
+    DinnerVote,
+    Draft,
+    DutyRoster,
+    Exclusion,
+    Expense,
+    ExpenseItem,
+    ItemParticipant,
+    JobRun,
+    Member,
+    Settlement,
+    User,
+    utcnow,
+)
 from kaznabot.settlement import split_amount
 
 log = logging.getLogger(__name__)
@@ -78,6 +93,13 @@ async def _merge_users(session: AsyncSession, stale: User, into: User) -> None:
         await session.delete(p)
         if dup is None:
             session.add(ItemParticipant(item_id=p.item_id, user_id=into.id))
+    for roster in await session.scalars(select(DutyRoster)):
+        if stale.id in roster.people:
+            roster.people = [into.id if uid == stale.id else uid for uid in roster.people]
+    for vote in await session.scalars(select(DinnerVote).where(DinnerVote.user_id == stale.id)):
+        if await session.get(DinnerVote, (vote.poll_id, into.id)) is None:
+            session.add(DinnerVote(poll_id=vote.poll_id, user_id=into.id, options=vote.options))
+        await session.delete(vote)
     await session.flush()
     await session.delete(stale)
     await session.flush()
@@ -358,11 +380,18 @@ async def migrate_chat(session: AsyncSession, old: int, new: int) -> ChatMove:
         else:  # человек уже успел написать в новый чат
             await _absorb(session, own, m)
     moved = 0
-    for model in (Expense, Settlement, Exclusion):
+    for model in (Expense, Settlement, Exclusion, DinnerPoll):
         move = update(model).where(model.chat_id == old).values(chat_id=new).returning(model.id)
         ids = list(await session.scalars(move))
         if model is Expense:
             moved = len(ids)
+    # Настройки и ротация: одна строка на чат. Если в новом чате их уже завели — оставляем новые
+    for single in (ChatFeatures, DutyRoster):
+        if await session.get(single, new) is None:
+            await session.execute(update(single).where(single.chat_id == old).values(chat_id=new))
+        else:
+            await session.execute(delete(single).where(single.chat_id == old))
+    await session.execute(update(JobRun).where(JobRun.chat_id == old).values(chat_id=new))
     # У сообщений в новом чате другие id, поэтому черновики со старыми кнопками закрываем
     close = (
         update(Draft)
@@ -373,6 +402,88 @@ async def migrate_chat(session: AsyncSession, old: int, new: int) -> ChatMove:
     threads = list(await session.scalars(close))
     await session.flush()
     return ChatMove(expenses=moved, cancelled_threads=threads)
+
+
+# --- дежурства и ужины ---
+
+
+async def features(session: AsyncSession, chat_id: int) -> ChatFeatures:
+    f = await session.get(ChatFeatures, chat_id)
+    if f is None:
+        f = ChatFeatures(chat_id=chat_id, duty_reminders=False, dinner_polls=False)
+        session.add(f)
+        await session.flush()
+    return f
+
+
+async def chats_with(session: AsyncSession, feature: str) -> list[int]:
+    return list(await session.scalars(select(ChatFeatures.chat_id).where(getattr(ChatFeatures, feature).is_(True))))
+
+
+async def roster_of(session: AsyncSession, chat_id: int) -> DutyRoster | None:
+    return await session.get(DutyRoster, chat_id)
+
+
+async def set_roster(session: AsyncSession, chat_id: int, anchor: date, zones: list[str], people: list[int]) -> None:
+    roster = await session.get(DutyRoster, chat_id)
+    if roster is None:
+        session.add(DutyRoster(chat_id=chat_id, anchor=anchor, zones=zones, people=people))
+    else:
+        roster.anchor, roster.zones, roster.people = anchor, zones, people
+    await session.flush()
+
+
+async def job_done(session: AsyncSession, chat_id: int, job: str, key: str) -> bool:
+    return await session.get(JobRun, (chat_id, job, key)) is not None
+
+
+def mark_job(session: AsyncSession, chat_id: int, job: str, key: str) -> None:
+    session.add(JobRun(chat_id=chat_id, job=job, key=key))
+
+
+async def dinner_poll_for_week(session: AsyncSession, chat_id: int, week_start: date) -> DinnerPoll | None:
+    q = select(DinnerPoll).where(DinnerPoll.chat_id == chat_id, DinnerPoll.week_start == week_start)
+    return (await session.scalars(q)).first()
+
+
+async def dinner_poll_by_tg(session: AsyncSession, poll_id: str) -> DinnerPoll | None:
+    return (await session.scalars(select(DinnerPoll).where(DinnerPoll.poll_id == poll_id))).first()
+
+
+async def latest_dinner_poll(session: AsyncSession, chat_id: int) -> DinnerPoll | None:
+    q = select(DinnerPoll).where(DinnerPoll.chat_id == chat_id).order_by(DinnerPoll.week_start.desc())
+    return (await session.scalars(q)).first()
+
+
+async def due_dinner_polls(session: AsyncSession, now_utc: datetime) -> list[DinnerPoll]:
+    q = select(DinnerPoll).where(DinnerPoll.closed_at.is_(None), DinnerPoll.deadline <= now_utc)
+    return list(await session.scalars(q))
+
+
+async def set_dinner_vote(session: AsyncSession, poll: DinnerPoll, user: User, options: list[int]) -> None:
+    """Пустой список — человек отозвал голос."""
+    vote = await session.get(DinnerVote, (poll.id, user.id))
+    if not options:
+        if vote is not None:
+            await session.delete(vote)
+    elif vote is None:
+        session.add(DinnerVote(poll_id=poll.id, user_id=user.id, options=options))
+    else:
+        vote.options = options
+    await session.flush()
+
+
+async def dinner_votes(session: AsyncSession, poll: DinnerPoll) -> dict[int, list[int]]:
+    q = select(DinnerVote).where(DinnerVote.poll_id == poll.id).order_by(DinnerVote.voted_at)
+    return {v.user_id: v.options for v in await session.scalars(q)}
+
+
+def deadline_utc(day: date, at: time, tz: ZoneInfo) -> datetime:
+    return datetime.combine(day, at, tzinfo=tz).astimezone(UTC).replace(tzinfo=None)
+
+
+def utc_to_local(dt: datetime, tz: ZoneInfo) -> datetime:
+    return dt.replace(tzinfo=UTC).astimezone(tz)
 
 
 # --- индекс черновиков ---

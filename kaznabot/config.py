@@ -1,3 +1,4 @@
+from datetime import time
 from zoneinfo import ZoneInfo
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -34,6 +35,11 @@ class Settings(BaseSettings):
     # Разбирать все фото в чате автоматически (не-чеки бот молча игнорирует).
     # Если выключено — только фото с подписью /add или @упоминанием бота.
     auto_parse_photos: bool = True
+
+    # Расписание быта (время местное, см. timezone)
+    duty_reminder_time: time = time(19, 0)  # суббота: кто дежурит в воскресенье
+    dinner_poll_time: time = time(12, 0)  # суббота: голосование «кто когда готовит ужин»
+    dinner_deadline_time: time = time(13, 0)  # понедельник: итог голосования
 
     @property
     def tz(self) -> ZoneInfo:
